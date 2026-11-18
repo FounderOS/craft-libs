@@ -50,7 +50,8 @@ pub enum Message {
 }
 
 enum Transport {
-    /// The same-origin parent window; only it is heard and answered.
+    /// The parent window: same-origin, or another origin from the page's allowlist
+    /// ([`crate::allow`]). Only it, at `origin`, is heard and answered.
     Parent { window: web_sys::Window, parent: web_sys::Window, origin: String },
     /// The app's canvas; messages are `CustomEvent`s on it.
     Page { canvas: web_sys::EventTarget },
@@ -66,7 +67,8 @@ pub struct Host {
 impl Host {
     /// The host for `app` (its id, as in `<app>:ready`) running on `canvas`, or `None` when the
     /// app is not hosted: no `?host=parent` and no `data-host="page"`, no framing parent, or a
-    /// parent on another origin (messages only go to this origin, so the browser would drop them).
+    /// parent on another origin that is not both named in `?parentOrigin=` and listed in the
+    /// page's `<meta name="craft-allowed-parents">` (see [`crate::allow`]).
     pub fn connect(app: &'static str, canvas: &web_sys::Element) -> Option<Self> {
         let window = web_sys::window()?;
         let query = window.location().search().unwrap_or_default();
@@ -77,6 +79,12 @@ impl Host {
                     return None;
                 }
                 let origin = window.location().origin().ok()?;
+                // Decided before the same-origin probe below, so another origin's location is
+                // never read when the query already says the parent is elsewhere.
+                if let Some(parent_origin) = crate::allow::cross_origin(&query, &origin) {
+                    let transport = listed_parent(window, parent, parent_origin)?;
+                    return Some(Self { app, transport, dirty: Cell::new(None) });
+                }
                 // Reading another origin's location throws, which is `None` too.
                 if parent.location().origin().ok()? != origin {
                     return None;
@@ -201,6 +209,23 @@ impl Host {
     }
 }
 
+/// The cross-origin `parent` at `origin` when the app's page lists that origin. Otherwise one
+/// console warning, so a misconfigured embed is visible, and `None`: the app runs unhosted and
+/// saves download, as for any parent it can't verify.
+fn listed_parent(window: web_sys::Window, parent: web_sys::Window, origin: String) -> Option<Transport> {
+    let list = window
+        .document()
+        .and_then(|document| document.query_selector("meta[name=craft-allowed-parents]").ok().flatten())
+        .and_then(|meta| meta.get_attribute("content"))
+        .unwrap_or_default();
+    if !crate::allow::allowed(&list, &origin) {
+        let warning = format!("craft-web-host: parent origin {origin} is not in <meta name=\"craft-allowed-parents\">; running unhosted");
+        web_sys::console::warn_1(&warning.into());
+        return None;
+    }
+    Some(Transport::Parent { window, parent, origin })
+}
+
 /// The message a host's object describes, or `None` when a required field is missing.
 fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
     Some(match kind {
@@ -319,6 +344,64 @@ mod tests {
         assert_eq!(received.get(), 0, "the expected origin with another source changes nothing");
         send(&origin, Some(&window));
         assert_eq!(received.get(), 1, "the same payload from the authorized parent is delivered");
+    }
+
+    #[wasm_bindgen_test]
+    fn a_cross_origin_parent_needs_the_pages_allowlist() {
+        let window = web_sys::window().unwrap();
+        let document = window.document().unwrap();
+        let connect = |origin: &str| match listed_parent(window.clone(), window.clone(), origin.to_string()) {
+            Some(Transport::Parent { origin, .. }) => Some(origin),
+            _ => None,
+        };
+        assert_eq!(connect("https://admin.kortly.no"), None, "no meta: no parent");
+        let meta = document.create_element("meta").unwrap();
+        meta.set_attribute("name", "craft-allowed-parents").unwrap();
+        document.document_element().unwrap().append_child(&meta).unwrap();
+        for (list, admitted) in [
+            ("http://localhost:5432 https://admin.kortly.no", true),
+            ("http://localhost:5432", false),
+            ("https://admin.kortly.no/", false),
+            ("*", false),
+            ("null", false),
+            ("", false),
+        ] {
+            meta.set_attribute("content", list).unwrap();
+            let expected = admitted.then(|| "https://admin.kortly.no".to_string());
+            assert_eq!(connect("https://admin.kortly.no"), expected, "{list:?}");
+        }
+        meta.remove();
+    }
+
+    #[wasm_bindgen_test]
+    fn a_cross_origin_parent_is_heard_only_from_its_origin() {
+        let window = web_sys::window().unwrap();
+        let own = window.location().origin().unwrap();
+        let parent_origin = "https://admin.kortly.no";
+        let host = Host {
+            app: "cross-origin-test",
+            transport: Transport::Parent { window: window.clone(), parent: window.clone(), origin: parent_origin.to_string() },
+            dirty: Cell::new(None),
+        };
+        let received = Rc::new(Cell::new(0));
+        let counter = received.clone();
+        host.listen(move |_| counter.set(counter.get() + 1));
+        let data = obj(&[("type", "cross-origin-test:saved".into()), ("id", "s1".into())]);
+        let send = |origin: &str, source: Option<&web_sys::Window>| {
+            let init = web_sys::MessageEventInit::new();
+            init.set_origin(origin);
+            init.set_source(source.map(|s| s.as_ref()));
+            init.set_data(&data);
+            window.dispatch_event(&web_sys::MessageEvent::new_with_event_init_dict("message", &init).unwrap()).unwrap();
+        };
+        send(&own, Some(&window));
+        assert_eq!(received.get(), 0, "the app's own origin is not the named parent");
+        send("https://admin.kortly.no.evil.example", Some(&window));
+        assert_eq!(received.get(), 0);
+        send(parent_origin, None);
+        assert_eq!(received.get(), 0, "the parent's origin from another source");
+        send(parent_origin, Some(&window));
+        assert_eq!(received.get(), 1);
     }
 
     fn obj(fields: &[(&str, JsValue)]) -> JsValue {

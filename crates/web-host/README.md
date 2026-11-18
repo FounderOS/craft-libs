@@ -5,7 +5,7 @@ The host messages between a Craft app's web build and the page that hosts it, as
 The crate has two parts:
 
 - **The contract** (all targets): the message kinds and their `<app>:<kind>` types, the contract version, how the hosting mode is read from the URL and the canvas, and the clean-up of file names a host passes in. Pure, tested natively.
-- **The bridge** (`web`, wasm32 only): `Host::connect(app, canvas)` finds the host, `listen` hears its messages, and `post_ready`, `post_save`, `post_dirty`, `post_failed` and `post_handoff` answer it. Only the same-origin parent window is heard and answered; with a parent on another origin the app runs as if unframed.
+- **The bridge** (`web`, wasm32 only): `Host::connect(app, canvas)` finds the host, `listen` hears its messages, and `post_ready`, `post_save`, `post_dirty`, `post_failed` and `post_handoff` answer it. Only the parent window is heard and answered: a same-origin one, or one on another origin that the page allows (below). With any other parent the app runs as if unframed.
 
 ## Messages
 
@@ -21,7 +21,19 @@ The crate has two parts:
 | `handoff` | app → host | `name`, and `bytes` or `file` + `size` | this file belongs to another app |
 | `handoff-done` | host → app | `name`, `app` | the host gave it to the app that edits it |
 
-With `?host=parent` a message is an object with `type` (`pdfcraft:open`) and the fields, sent with same-origin `postMessage`; `bytes` go as a transferred `ArrayBuffer`. With `data-host="page"` it is a `CustomEvent` of that type on the canvas, with the fields in `detail`.
+With `?host=parent` a message is an object with `type` (`pdfcraft:open`) and the fields, sent with `postMessage` to the parent's origin; `bytes` go as a transferred `ArrayBuffer`. With `data-host="page"` it is a `CustomEvent` of that type on the canvas, with the fields in `detail`.
+
+### A parent on another origin
+
+A page on another origin frames the app with `?host=parent&parentOrigin=<its origin, URL-encoded>`. The app connects only when its own HTML lists that origin:
+
+```html
+<meta name="craft-allowed-parents" content="https://admin.example http://localhost:5432">
+```
+
+- Origins are `scheme://host[:port]` as a browser reports them (lowercase, no default port), separated by spaces and compared exactly (scheme, host and port). `*`, `null` and an empty list allow no one.
+- Every message the app posts uses that origin as `targetOrigin`, so the browser delivers it only if the parent really is there. Incoming messages need that `origin` and `window.parent` as their `source`.
+- An origin not in the list leaves the app unhosted (saves download) with one console warning. A same-origin parent needs neither the parameter nor the list.
 
 Compatibility with the bridges shipped before this crate:
 
